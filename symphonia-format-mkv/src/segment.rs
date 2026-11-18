@@ -1072,7 +1072,10 @@ impl EbmlElement<MkvSchema> for CuesElement {
 pub(crate) struct CuePointElement {
     /// Time in segment ticks.
     pub(crate) time: MatroskaTicks,
-    pub(crate) positions: CueTrackPositionsElement,
+    /// Track positions for every track referenced by this cue point. A cue point may contain
+    /// multiple track positions, one for each track that has a keyframe at, or near, the cue point's
+    /// time.
+    pub(crate) positions: Box<[CueTrackPositionsElement]>,
 }
 
 impl EbmlElement<MkvSchema> for CuePointElement {
@@ -1080,7 +1083,7 @@ impl EbmlElement<MkvSchema> for CuePointElement {
 
     fn read<R: ReadEbml>(it: &mut MkvEbmlIterator<R>, hdr: &MkvEbmlElementHeader) -> Result<Self> {
         let mut time = None;
-        let mut positions = None;
+        let mut positions = Vec::new();
 
         while let Some(child) = it.next_header()? {
             match child.element_type() {
@@ -1089,8 +1092,8 @@ impl EbmlElement<MkvSchema> for CuePointElement {
                     time = Some(MatroskaTicks(it.read_u64_no_default()?));
                 }
                 MkvElement::CueTrackPositions => {
-                    // Mandatory element.
-                    positions = Some(it.read_master_element()?);
+                    // Mandatory element. One or more track positions may be present per cue point.
+                    positions.push(it.read_master_element()?);
                 }
                 other => {
                     // Unexpected child element.
@@ -1101,7 +1104,12 @@ impl EbmlElement<MkvSchema> for CuePointElement {
 
         Ok(Self {
             time: time.ok_or(EbmlError::ElementError("mkv: missing time in cue"))?,
-            positions: positions.ok_or(EbmlError::ElementError("mkv: missing positions in cue"))?,
+            positions: if positions.is_empty() {
+                return Err(EbmlError::ElementError("mkv: missing positions in cue"));
+            }
+            else {
+                positions.into_boxed_slice()
+            },
         })
     }
 }

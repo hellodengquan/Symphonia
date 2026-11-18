@@ -396,11 +396,31 @@ impl<R: ReadEbml, S: EbmlSchema> EbmlIterator<R, S> {
     /// Restore the state of the iterator.
     pub(crate) fn restore_state(&mut self, state: EbmlIteratorState<S>) -> Result<()>
     where
-        R: MediaSource,
+        R: MediaSource + SeekBuffered,
     {
-        self.reader.seek(SeekFrom::Start(state.pos))?;
+        // Restore the in-memory element state first so it remains consistent even if the underlying
+        // reader cannot be repositioned physically.
         self.current = state.current;
         self.stack = state.stack;
+
+        // Prefer a buffered seek, which only moves within the read-ahead ring and never touches the
+        // underlying media source. This keeps state restoration working on unseekable sources when
+        // the target position is still within the buffered seek-back range; fall back to a real seek
+        // otherwise.
+        let target = state.pos;
+        let current = self.reader.pos();
+        let buffered_back = self.reader.read_buffer_len() as u64;
+        let buffered_forward = self.reader.unread_buffer_len() as u64;
+        let within_buffer = target <= current && current - target <= buffered_back
+            || target >= current && target - current <= buffered_forward;
+
+        if within_buffer {
+            self.reader.seek_buffered(target);
+        }
+        else {
+            self.reader.seek(SeekFrom::Start(target))?;
+        }
+
         Ok(())
     }
 
@@ -441,6 +461,18 @@ impl<R: ReadEbml, S: EbmlSchema> EbmlIterator<R, S> {
 
         // Reset the iterator so that a call to next_element or next_header yields the child
         // element.
+        self.current = None;
+        Ok(())
+    }
+
+    /// Seek the underlying reader to an absolute byte position in the stream, resetting the
+    /// iterator so the next header read starts there. The element hierarchy (stack) is left
+    /// untouched and must already describe the container of the element at `pos`.
+    pub(crate) fn seek_to_abs_pos(&mut self, pos: u64) -> Result<()>
+    where
+        R: MediaSource,
+    {
+        self.reader.seek(SeekFrom::Start(pos))?;
         self.current = None;
         Ok(())
     }
