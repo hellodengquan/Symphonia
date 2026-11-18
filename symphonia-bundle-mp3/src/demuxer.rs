@@ -45,6 +45,9 @@ pub struct MpaReader<'s> {
     metadata: MetadataLog,
     first_packet_pos: u64,
     next_packet_ts: Timestamp,
+    /// A seek index reconstructed from a Xing/Info or VBRI tag's time-to-byte mapping table. When
+    /// available, coarse seeks use the index instead of a linear estimation over the stream.
+    seek_index: Option<SeekIndex>,
 }
 
 impl Scoreable for MpaReader<'_> {
@@ -285,7 +288,10 @@ impl FormatReader for MpaReader<'_> {
         //
         // In coarse seek mode, the underlying media source stream will be roughly seeked based on
         // the required timestamp and the total duration of the media. Coarse seek mode requires a
-        // seekable stream because the total length in bytes of the stream is required.
+        // seekable stream because the total length in bytes of the stream is required. If a Xing or
+        // VBRI tag provides a time-to-byte mapping table, the mapping table is used to obtain the
+        // approximate byte position instead of a linear estimation so that the position remains
+        // accurate for variable bitrate streams.
         //
         // In accurate seek mode, the underlying media source stream will not be seeked unless the
         // required timestamp is in the past, in which case the stream is seeked back to the start.
@@ -429,9 +435,15 @@ impl<'s> MpaReader<'s> {
         track.with_codec_params(CodecParameters::Audio(codec_params));
 
         // Check if there is a Xing/Info tag contained in the first frame.
-        if let Some(info_tag) = try_read_info_tag(&packet, &header) {
+        let info_tag = try_read_info_tag(&packet, &header);
+        let vbri_tag = if info_tag.is_some() { None } else { try_read_vbri_tag(&packet, &header) };
+
+        // A seek index, reconstructed from the tag's time-to-byte mapping table.
+        let mut seek_index = None;
+
+        if let Some(info_tag) = &info_tag {
             // The LAME tag contains ReplayGain and padding information.
-            if let Some(lame_tag) = info_tag.lame {
+            if let Some(lame_tag) = &info_tag.lame {
                 track.with_delay(lame_tag.enc_delay).with_padding(lame_tag.enc_padding);
             }
 
@@ -447,14 +459,55 @@ impl<'s> MpaReader<'s> {
 
                 track.with_num_frames(num_frames.saturating_sub(u64::from(discard)));
             }
+
+            // A Xing/Info tag may provide a table of contents mapping points in time to byte
+            // offsets within the stream. The table spans the full encoded duration, including
+            // encoder delay and padding.
+            if let Some(toc) = info_tag.toc {
+                let total_ts =
+                    u64::from(info_tag.num_frames.unwrap_or(0)) * u64::from(header.num_frames());
+
+                // The table's byte offsets are fractions of the stream's audio data length. The
+                // length is only known for seekable media sources.
+                let audio_byte_len = mss.byte_len().map(|len| len.saturating_sub(mss.pos()));
+
+                seek_index =
+                    audio_byte_len.and_then(|len| SeekIndex::from_xing_toc(toc, total_ts, len));
+
+                if seek_index.is_some() {
+                    info!("using xing table of contents for coarse seeks");
+                }
+                else {
+                    warn!("xing table of contents is invalid, it will not be used");
+                }
+            }
         }
-        else if let Some(vbri_tag) = try_read_vbri_tag(&packet, &header) {
+        else if let Some(vbri_tag) = &vbri_tag {
             info!("using vbri header for duration");
 
             let num_frames = u64::from(vbri_tag.num_mpeg_frames) * u64::from(header.num_frames());
 
             // Check if there is a VBRI tag.
             track.with_num_frames(num_frames);
+
+            // A VBRI tag always carries a seek table mapping groups of MPEG frames to byte offsets
+            // within the stream.
+            let total_ts = u64::from(vbri_tag.num_mpeg_frames) * u64::from(header.num_frames());
+
+            seek_index = SeekIndex::from_vbri_entries(
+                &vbri_tag.entries,
+                vbri_tag.entry_scale,
+                vbri_tag.frames_per_entry,
+                total_ts,
+                &header,
+            );
+
+            if seek_index.is_some() {
+                info!("using vbri seek table for coarse seeks");
+            }
+            else {
+                warn!("vbri seek table is invalid, it will not be used");
+            }
         }
         else {
             // The first frame was not a Xing/Info header, rewind back to the start of the frame so
@@ -487,6 +540,7 @@ impl<'s> MpaReader<'s> {
             metadata: opts.external_data.metadata.unwrap_or_default(),
             first_packet_pos,
             next_packet_ts,
+            seek_index,
         })
     }
 
@@ -501,7 +555,7 @@ impl<'s> MpaReader<'s> {
         // Get the length in bytes of the stream's audio data. It is not possible to coarsely seek
         // without knowing this.
         let audio_byte_len = match self.reader.byte_len() {
-            Some(byte_len) => u128::from(byte_len - self.first_packet_pos),
+            Some(byte_len) => byte_len - self.first_packet_pos,
             None => return seek_error(SeekErrorKind::Unseekable),
         };
 
@@ -516,13 +570,46 @@ impl<'s> MpaReader<'s> {
         debug_assert!(min_ts <= required_ts);
         debug_assert!(required_ts <= max_ts);
 
+        // If the stream's tag provides a time-to-byte mapping table, use it to find the approximate
+        // byte position. The table's accuracy determines the error of the coarse seek regardless of
+        // any variation in the bitrate. If the table cannot be used for some reason, fall back to
+        // the linear estimation below.
+        if let Some(seek_index) = self.seek_index.take() {
+            match self.preseek_coarse_indexed(&seek_index, required_ts, min_ts, max_ts) {
+                Ok(()) => {
+                    self.seek_index = Some(seek_index);
+                    return Ok(());
+                }
+                Err(err) => {
+                    // Restore the index and fall back to the linear estimation.
+                    self.seek_index = Some(seek_index);
+                    warn!(
+                        "failed to use the seek index ({err}), falling back to linear estimation"
+                    );
+                }
+            }
+        }
+
+        self.preseek_coarse_linear(required_ts, min_ts, max_ts, audio_byte_len)
+    }
+
+    /// Seeks the media source stream to a byte position, estimated from the linear relationship
+    /// between the stream's total duration and length in bytes.
+    fn preseek_coarse_linear(
+        &mut self,
+        required_ts: Timestamp,
+        min_ts: Timestamp,
+        max_ts: Timestamp,
+        audio_byte_len: u64,
+    ) -> Result<()> {
         // The total duration of the track.
         let total_dur = u128::from(max_ts.abs_delta(min_ts).get());
 
         // Calculate, roughly, the byte position of where the MPEG frame containing the required
         // timestamp should be in the media source stream relative to the start of the audio data.
-        let seek_pos_rel =
-            (u128::from(required_ts.abs_delta(min_ts).get()) * audio_byte_len) / total_dur;
+        let seek_pos_rel = (u128::from(required_ts.abs_delta(min_ts).get())
+            * u128::from(audio_byte_len))
+            / total_dur;
 
         // It is preferable to return a packet with a timestamp before the requested timestamp.
         // Therefore, subtract the maximum packet size from the position found above to ensure this.
@@ -542,7 +629,8 @@ impl<'s> MpaReader<'s> {
 
         // Calculate, roughly, the duration from the start of the audio of the packet based on the
         // byte position after resync.
-        let dur_to_pkt = Duration::from(((audio_byte_pos * total_dur) / audio_byte_len) as u64);
+        let dur_to_pkt =
+            Duration::from(((audio_byte_pos * total_dur) / u128::from(audio_byte_len)) as u64);
 
         // Assume the duration of a packet remains constant throughout the stream (not a
         // guarantee, but usually the case).
@@ -551,12 +639,79 @@ impl<'s> MpaReader<'s> {
         // Compute the timestamp of the next packet. First align the estimated duration from the
         // start of the audio to a packet boundary. Then add to the lower-bound timestamp. In
         // theory, this should never exceed the upper-bound timestamp.
-        //
         self.next_packet_ts = min_ts
             .checked_add(
                 dur_to_pkt.align_down(pkt_dur).expect("packet duration is always non-zero"),
             )
             .unwrap_or(max_ts);
+
+        Ok(())
+    }
+
+    /// Seeks the media source stream to a byte position, estimated from the time-to-byte mapping
+    /// table stored in the stream's Xing/Info or VBRI tag.
+    fn preseek_coarse_indexed(
+        &mut self,
+        seek_index: &SeekIndex,
+        required_ts: Timestamp,
+        min_ts: Timestamp,
+        max_ts: Timestamp,
+    ) -> Result<()> {
+        // The total encoded duration, in timebase units, covered by the seek index. The index's
+        // mapping table is indexed relative to the start of the encoded audio which begins at the
+        // lower-bound timestamp.
+        let total_dur = max_ts.abs_delta(min_ts).get();
+
+        // Sanity check that the duration used to build the index matches the track's current
+        // bounds. If they do not agree, the mapping table cannot be used reliably, so fall back to
+        // the linear estimation.
+        if seek_index.total_ts() != total_dur {
+            return seek_error(SeekErrorKind::Unseekable);
+        }
+
+        // The offset, in timebase units, of the requested timestamp relative to the start of the
+        // encoded audio.
+        let req_offset = required_ts.abs_delta(min_ts).get();
+
+        // Select an anchor at, or before, the requested timestamp. The anchor is a real frame
+        // boundary with an exact timestamp, so seeking to it keeps the subsequent frame scan
+        // consistent.
+        let anchor = seek_index.seek_anchor(req_offset);
+
+        // It is preferable to begin slightly before the anchor so that any reference (main data)
+        // preceding the anchor's frame is available to the decoder. The following resync discards
+        // any partial frame and lands on the anchor or a later, valid frame. Clamp to the start of
+        // the audio data.
+        let seek_pos_rel =
+            u128::from(anchor.byte_offset).saturating_sub(MAX_MPEG_FRAME_SIZE as u128);
+
+        let seek_pos = u128::from(self.first_packet_pos) + seek_pos_rel;
+
+        self.reader.seek(SeekFrom::Start(
+            seek_pos.try_into().map_err(|_| Error::SeekError(SeekErrorKind::OutOfRange))?,
+        ))?;
+
+        // Resync to, and consume, the next valid MPEG frame. This mirrors the linear estimation
+        // path: the consumed frame's timestamp is assigned below, and the frame-by-frame scan
+        // begins on the frame immediately following it.
+        let (resync_header, _) = read_mpeg_frame_strict(&mut self.reader)?;
+
+        // Because the seek landed no later than the anchor, the resynced frame is the anchor frame
+        // or a later one. In either case it lies at, or before, the requested timestamp. Its exact
+        // timestamp is the anchor's timestamp plus one frame duration for the frame the scan will
+        // encounter first.
+        let next_frame_dur = resync_header.duration();
+
+        let next_frame_offset =
+            anchor.ts_offset.checked_add(next_frame_dur.get()).unwrap_or(req_offset);
+
+        // Never label a frame past the requested timestamp; such a label would cause the scan to
+        // overshoot. The anchor is always at, or before, the request, so clamping here only removes
+        // a possible single-frame overshoot when the target is the anchor itself.
+        let next_frame_offset = next_frame_offset.min(req_offset);
+
+        self.next_packet_ts =
+            min_ts.checked_add(Duration::from(next_frame_offset)).unwrap_or(max_ts);
 
         Ok(())
     }
@@ -658,6 +813,158 @@ fn is_frame_header_similar(header: &FrameHeader, sync: u32) -> bool {
 struct FramePos {
     ts: Timestamp,
     pos: u64,
+}
+
+/// A single point of a seek index relating an offset in time, in timebase units, to a byte offset
+/// relative to the start of the audio data in the media source stream.
+#[derive(Copy, Clone, Debug)]
+struct SeekPoint {
+    /// The offset in timebase units from the start of the encoded audio.
+    ts_offset: u64,
+    /// The offset in bytes from the start of the audio data.
+    byte_offset: u64,
+}
+
+/// A seek index reconstructed from the time-to-byte mapping table stored in a Xing/Info or VBRI
+/// tag.
+///
+/// The index is stored as a list of anchor points. Each anchor is a real MPEG frame boundary whose
+/// byte offset and timestamp are both known exactly relative to the start of the audio data. Seeking
+/// to an anchor therefore lands on a frame whose timestamp can be assigned exactly, after which a
+/// simple one-frame-at-a-time scan reaches the requested frame. This keeps the accuracy of a coarse
+/// seek bounded by the spacing of the mapping table entries rather than the variation of the
+/// stream's bitrate.
+///
+/// All byte offsets are relative to the start of the audio data in the media source stream, and all
+/// timestamps are relative to the start of the encoded audio.
+#[derive(Clone, Debug)]
+struct SeekIndex {
+    /// The anchor points, ordered by increasing time and byte offset.
+    anchors: Vec<SeekPoint>,
+    /// The total number of timebase units spanned by the encoded audio.
+    total_ts: u64,
+}
+
+impl SeekIndex {
+    /// Reconstruct a seek index from a Xing/Info tag's 100-entry table of contents.
+    ///
+    /// `audio_byte_len` is the length in bytes of the stream's audio data. Each table entry is a
+    /// byte offset expressed as a fraction of the audio data length in units of 1/256th. The 100
+    /// entries are spaced evenly across the full encoded duration.
+    ///
+    /// Returns `None` if the table is empty, invalid, or the audio length is unknown.
+    fn from_xing_toc(toc: [u8; 100], total_ts: u64, audio_byte_len: u64) -> Option<Self> {
+        if total_ts == 0 || audio_byte_len == 0 {
+            return None;
+        }
+
+        // The first entry should always be 0. Reject the table if it is not since it is likely
+        // corrupt.
+        if toc[0] != 0 {
+            return None;
+        }
+
+        // All entries must be monotonically non-decreasing for the table to describe a valid
+        // mapping.
+        if toc.windows(2).any(|w| w[0] > w[1]) {
+            return None;
+        }
+
+        // The table only spans a meaningful duration if at least one non-zero entry is present.
+        if toc.iter().all(|&v| v == 0) {
+            return None;
+        }
+
+        let mut anchors = Vec::with_capacity(100);
+
+        for (idx, &entry) in toc.iter().enumerate() {
+            // Entry `idx` describes the frame at `idx / 100` of the encoded duration.
+            let ts_offset = u128::from(idx as u64) * u128::from(total_ts) / 100;
+            let byte_offset = u128::from(entry) * u128::from(audio_byte_len) / 256;
+
+            anchors
+                .push(SeekPoint { ts_offset: ts_offset as u64, byte_offset: byte_offset as u64 });
+        }
+
+        Some(SeekIndex { anchors, total_ts })
+    }
+
+    /// Reconstruct a seek index from a VBRI tag's seek table entries. The raw entries are ordered by
+    /// increasing time and must each be multiplied by `entry_scale` to obtain their byte offsets
+    /// relative to the start of the audio data. Consecutive entries are separated by
+    /// `frames_per_entry` MPEG frames, and entry 0 describes the frames beginning at the start of the
+    /// audio.
+    ///
+    /// Returns `None` if the table is empty or invalid.
+    fn from_vbri_entries(
+        raw_entries: &[u32],
+        entry_scale: u16,
+        frames_per_entry: u16,
+        total_ts: u64,
+        header: &FrameHeader,
+    ) -> Option<Self> {
+        if raw_entries.is_empty() || total_ts == 0 || frames_per_entry == 0 || entry_scale == 0 {
+            return None;
+        }
+
+        let frames_per_entry = u64::from(frames_per_entry);
+        let frame_dur = u64::from(header.num_frames());
+
+        let mut anchors: Vec<SeekPoint> = Vec::with_capacity(raw_entries.len());
+
+        for (idx, &raw) in raw_entries.iter().enumerate() {
+            // Apply the scale factor to obtain the byte offset relative to the start of the audio
+            // data.
+            let byte_offset = u64::from(raw).saturating_mul(u64::from(entry_scale));
+
+            // Offsets must be monotonically non-decreasing. A zero first entry is valid because it
+            // simply points to the start of the audio data, but a backwards offset later in the
+            // table indicates corruption.
+            if let Some(prev) = anchors.last() {
+                if byte_offset < prev.byte_offset {
+                    return None;
+                }
+            }
+
+            // Entry 0 describes the frames starting at the beginning of the encoded audio.
+            let ts_offset =
+                u64::try_from(idx).ok()?.saturating_mul(frames_per_entry) * frame_dur;
+
+            anchors.push(SeekPoint { ts_offset, byte_offset });
+        }
+
+        Some(SeekIndex { anchors, total_ts })
+    }
+
+    /// The total number of timebase units spanned by the encoded audio described by the index.
+    fn total_ts(&self) -> u64 {
+        self.total_ts
+    }
+
+    /// Select the anchor point to seek to for a requested timestamp offset, in timebase units from
+    /// the start of the encoded audio.
+    ///
+    /// The selected anchor is the latest anchor whose timestamp is at, or before, the requested
+    /// timestamp, after skipping a few anchors backwards so that several frames precede the target.
+    /// Those preceding frames supply any reference (main data) the decoder may require and amortize
+    /// the limited precision of the mapping table. The returned anchor always lies within the valid
+    /// audio range.
+    fn seek_anchor(&self, req_offset: u64) -> SeekPoint {
+        // Find the first anchor strictly after the requested timestamp. The anchor immediately
+        // before it is therefore the latest anchor at, or before, the request.
+        let end = self.anchors.partition_point(|anchor| anchor.ts_offset <= req_offset);
+
+        // The latest anchor at, or before, the request. If the request precedes every anchor, start
+        // from the first anchor.
+        let target_idx = end.saturating_sub(1);
+
+        // Skip a few anchors backwards to leave reference frames ahead of the seek point. Never
+        // index past the first anchor.
+        const BACKTRACK_ANCHORS: usize = 2;
+        let anchor_idx = target_idx.saturating_sub(BACKTRACK_ANCHORS);
+
+        self.anchors[anchor_idx]
+    }
 }
 
 /// Reads the main_data_begin field from the side information of a MPEG audio frame.
@@ -974,6 +1281,15 @@ const VBRI_TAG_ID: [u8; 4] = *b"VBRI";
 struct VbriTag {
     num_bytes: u32,
     num_mpeg_frames: u32,
+    /// The number of MPEG frames spanned by a single seek table entry.
+    frames_per_entry: u16,
+    /// The scale factor applied to each raw seek table entry to obtain a byte offset.
+    entry_scale: u16,
+    /// The size in bytes of a single seek table entry.
+    entry_size: u16,
+    /// The raw seek table entries, ordered by increasing time. Each entry must be multiplied by
+    /// `entry_scale` to obtain the byte offset relative to the start of the audio data.
+    entries: Vec<u32>,
 }
 
 /// Try to read a VBRI tag from the provided MPEG frame.
@@ -1015,7 +1331,69 @@ fn try_read_vbri_tag_inner(buf: &[u8], header: &FrameHeader) -> Result<Option<Vb
     let num_bytes = reader.read_be_u32()?;
     let num_mpeg_frames = reader.read_be_u32()?;
 
-    Ok(Some(VbriTag { num_bytes, num_mpeg_frames }))
+    // The seek table's metadata immediately follows the fixed portion of the tag.
+    let num_entries = u64::from(reader.read_be_u16()?);
+    let entry_scale = reader.read_be_u16()?;
+    let entry_size = reader.read_be_u16()?;
+    let frames_per_entry = reader.read_be_u16()?;
+
+    // Validate the seek table's metadata before attempting to parse it. Each entry is a big-endian
+    // integer of `entry_size` bytes, though only 1, 2, or 4-byte entries are defined.
+    if frames_per_entry == 0
+        || num_entries == 0
+        || entry_scale == 0
+        || !matches!(entry_size, 1 | 2 | 4)
+    {
+        // The fixed portion of the tag is still valid, so return it without a seek table.
+        warn!("vbri tag has an invalid seek table, the table will not be used");
+
+        return Ok(Some(VbriTag {
+            num_bytes,
+            num_mpeg_frames,
+            frames_per_entry,
+            entry_scale,
+            entry_size,
+            entries: Vec::new(),
+        }));
+    }
+
+    // The seek table must fit within the provided frame.
+    let table_len = num_entries.saturating_mul(u64::from(entry_size));
+
+    if reader.bytes_available() < table_len {
+        warn!("vbri seek table is truncated, the table will not be used");
+
+        return Ok(Some(VbriTag {
+            num_bytes,
+            num_mpeg_frames,
+            frames_per_entry,
+            entry_scale,
+            entry_size,
+            entries: Vec::new(),
+        }));
+    }
+
+    let mut entries = Vec::with_capacity(num_entries as usize);
+
+    for _ in 0..num_entries {
+        let entry = match entry_size {
+            1 => u32::from(reader.read_u8()?),
+            2 => u32::from(reader.read_be_u16()?),
+            4 => reader.read_be_u32()?,
+            _ => unreachable!(),
+        };
+
+        entries.push(entry);
+    }
+
+    Ok(Some(VbriTag {
+        num_bytes,
+        num_mpeg_frames,
+        frames_per_entry,
+        entry_scale,
+        entry_size,
+        entries,
+    }))
 }
 
 /// Perform a fast check to see if the packet contains a VBRI tag. If this returns true, the
@@ -1108,5 +1486,605 @@ mod tests {
 
         // Ensure the heuristic returns true even if a non-zero CRC is present.
         assert!(is_maybe_vbri_tag(&buf, &header));
+    }
+
+    // =========================================================================================
+    // Helpers for building synthetic MPEG audio streams.
+    // =========================================================================================
+
+    /// The number of samples per MPEG frame for the synthetic test streams (MPEG1 Layer3).
+    const SAMPLES_PER_FRAME: u64 = 1152;
+
+    /// Build a MPEG1 Layer3, stereo, 44.1kHz frame header word for the given bitrate.
+    fn mpeg1_l3_header_word(bitrate: u32) -> u32 {
+        // The bitrate index for MPEG1 Layer3 is looked up in BIT_RATES_MPEG1_L3.
+        let bitrate_idx: u32 = match bitrate {
+            32_000 => 1,
+            40_000 => 2,
+            48_000 => 3,
+            56_000 => 4,
+            64_000 => 5,
+            80_000 => 6,
+            96_000 => 7,
+            112_000 => 8,
+            128_000 => 9,
+            160_000 => 10,
+            192_000 => 11,
+            224_000 => 12,
+            256_000 => 13,
+            320_000 => 14,
+            _ => panic!("unsupported test bitrate {bitrate}"),
+        };
+
+        // 0xfffb: 11 sync bits, MPEG1 (0b11), Layer3 (0b01), no CRC (protection bit 1).
+        // 0x90: bitrate index in the high nibble (sample-rate index 0 -> 44.1kHz, no padding).
+        // 0x00: stereo joint-stereo extension bits zeroed, no copyright/original/emphasis.
+        0xfffb_0000 | (bitrate_idx << 12) | 0x0090
+    }
+
+    /// The size in bytes (excluding the 4-byte header) of a MPEG1 Layer3, 44.1kHz frame.
+    fn mpeg1_l3_frame_size(bitrate: u32) -> usize {
+        // 144 * bitrate / sample_rate - 4, with no padding slot.
+        (144 * bitrate / 44_100) as usize - 4
+    }
+
+    /// Build a single MPEG frame as a byte vector. The frame body is zeroed so it is never mistaken
+    /// for another frame sync word.
+    fn build_frame(bitrate: u32) -> Vec<u8> {
+        let header = mpeg1_l3_header_word(bitrate);
+        let frame_size = mpeg1_l3_frame_size(bitrate);
+
+        let mut frame = vec![0u8; MPEG_HEADER_LEN + frame_size];
+        frame[0..MPEG_HEADER_LEN].copy_from_slice(&header.to_be_bytes());
+        frame
+    }
+
+    /// Insert a Xing tag with the provided 100-entry table of contents into the first frame.
+    fn insert_xing_tag(frame: &mut [u8], num_mpeg_frames: u32, toc: [u8; 100]) {
+        let header =
+            header::parse_frame_header(u32::from_be_bytes(frame[0..4].try_into().unwrap()))
+                .unwrap();
+
+        // The tag begins right after the side information. For MPEG1 stereo this is 36 bytes.
+        let offset = MPEG_HEADER_LEN + header.side_info_len();
+
+        frame[offset..offset + 4].copy_from_slice(b"Xing");
+        // Flags: num_frames (0x1) | num_bytes (0x2) | toc (0x4).
+        frame[offset + 4..offset + 8].copy_from_slice(&7u32.to_be_bytes());
+        frame[offset + 8..offset + 12].copy_from_slice(&num_mpeg_frames.to_be_bytes());
+
+        // The total number of bytes in the audio data; filled in by the caller's stream builder.
+        // Use a placeholder of 0 here and overwrite once the full stream is assembled.
+        frame[offset + 12..offset + 16].copy_from_slice(&0u32.to_be_bytes());
+        frame[offset + 16..offset + 116].copy_from_slice(&toc);
+    }
+
+    /// Overwrite the num_bytes field of a Xing tag.
+    fn set_xing_num_bytes(stream: &mut [u8], first_frame_len: usize, num_bytes: u32) {
+        let header =
+            header::parse_frame_header(u32::from_be_bytes(stream[0..4].try_into().unwrap()))
+                .unwrap();
+        let offset = MPEG_HEADER_LEN + header.side_info_len();
+        stream[offset + 12..offset + 16].copy_from_slice(&num_bytes.to_be_bytes());
+        let _ = first_frame_len;
+    }
+
+    /// Insert a VBRI tag with a seek table into the first frame. `entries` are the raw table
+    /// entries; each entry occupies `entry_size` bytes and is scaled by `entry_scale` at parse.
+    fn insert_vbri_tag(
+        frame: &mut [u8],
+        num_mpeg_frames: u32,
+        num_entries: u16,
+        entry_scale: u16,
+        entry_size: u16,
+        frames_per_entry: u16,
+        entries: &[u32],
+    ) {
+        // The fixed VBRI tag starts 32 bytes after the header.
+        let base = MPEG_HEADER_LEN + 32;
+
+        frame[base..base + 4].copy_from_slice(b"VBRI");
+        frame[base + 4..base + 6].copy_from_slice(&1u16.to_be_bytes()); // version
+        frame[base + 6..base + 8].copy_from_slice(&0u16.to_be_bytes()); // delay
+        frame[base + 8..base + 10].copy_from_slice(&0u16.to_be_bytes()); // quality
+        frame[base + 10..base + 14].copy_from_slice(&0u32.to_be_bytes()); // num bytes
+        frame[base + 14..base + 18].copy_from_slice(&num_mpeg_frames.to_be_bytes());
+        frame[base + 18..base + 20].copy_from_slice(&num_entries.to_be_bytes());
+        frame[base + 20..base + 22].copy_from_slice(&entry_scale.to_be_bytes());
+        frame[base + 22..base + 24].copy_from_slice(&entry_size.to_be_bytes());
+        frame[base + 24..base + 26].copy_from_slice(&frames_per_entry.to_be_bytes());
+
+        let table_base = base + 26;
+
+        for (idx, &entry) in entries.iter().enumerate() {
+            let off = table_base + idx * entry_size as usize;
+            match entry_size {
+                1 => frame[off] = entry as u8,
+                2 => frame[off..off + 2].copy_from_slice(&(entry as u16).to_be_bytes()),
+                4 => frame[off..off + 4].copy_from_slice(&entry.to_be_bytes()),
+                _ => panic!("unsupported entry size"),
+            }
+        }
+    }
+
+    /// Build a synthetic VBR stream of `num_frames` frames. The first frame is encoded at
+    /// `first_bitrate` so it is large enough to hold a Xing/Info or VBRI tag. Subsequent frames
+    /// alternate between `low_bitrate` and `high_bitrate` so the linear byte/time relationship does
+    /// not hold.
+    fn build_vbr_stream(
+        num_frames: u32,
+        first_bitrate: u32,
+        low_bitrate: u32,
+        high_bitrate: u32,
+        make_tag: impl FnOnce(&mut [u8], usize),
+    ) -> Vec<u8> {
+        let mut stream = Vec::new();
+
+        // Build the first frame separately so the tag closure, which is consumed once, is applied
+        // exactly once.
+        let mut first_frame = build_frame(first_bitrate);
+        let first_frame_len = first_frame.len();
+        make_tag(&mut first_frame, first_frame_len);
+        stream.extend_from_slice(&first_frame);
+
+        for idx in 1..num_frames {
+            let bitrate = if idx % 2 == 0 { low_bitrate } else { high_bitrate };
+            let frame = build_frame(bitrate);
+            stream.extend_from_slice(&frame);
+        }
+
+        stream
+    }
+
+    /// Open a synthetic stream as a `MpaReader`.
+    fn open_reader(stream: Vec<u8>) -> MpaReader<'static> {
+        let mss =
+            MediaSourceStream::new(Box::new(std::io::Cursor::new(stream)), Default::default());
+        MpaReader::try_new(mss, FormatOptions::default()).expect("reader should open")
+    }
+
+    // =========================================================================================
+    // SeekIndex unit tests.
+    // =========================================================================================
+
+    fn test_header() -> FrameHeader {
+        header::parse_frame_header(mpeg1_l3_header_word(128_000)).unwrap()
+    }
+
+    #[test]
+    fn test_xing_seek_index_rejects_invalid_tables() {
+        // A zero total duration is rejected.
+        assert!(SeekIndex::from_xing_toc([0; 100], 0, 10_000).is_none());
+
+        // A zero audio length is rejected.
+        assert!(SeekIndex::from_xing_toc([0; 100], 1152, 0).is_none());
+
+        // A non-zero first entry is rejected.
+        let mut toc = [0u8; 100];
+        toc[0] = 1;
+        assert!(SeekIndex::from_xing_toc(toc, 1152, 10_000).is_none());
+
+        // A table that decreases is rejected.
+        let mut toc = [0u8; 100];
+        toc[1] = 10;
+        toc[2] = 5;
+        assert!(SeekIndex::from_xing_toc(toc, 1152, 10_000).is_none());
+
+        // An all-zero table is rejected.
+        assert!(SeekIndex::from_xing_toc([0u8; 100], 1152, 10_000).is_none());
+    }
+
+    #[test]
+    fn test_xing_seek_index_anchors() {
+        // A linearly increasing TOC where entry i maps to i/100 of the stream.
+        let mut toc = [0u8; 100];
+        for (i, entry) in toc.iter_mut().enumerate() {
+            *entry = ((i as u64 * 255) / 99).min(255) as u8;
+        }
+
+        let total_ts = 100 * SAMPLES_PER_FRAME;
+        let audio_byte_len = 10_000u64;
+
+        let index = SeekIndex::from_xing_toc(toc, total_ts, audio_byte_len).expect("valid toc");
+
+        // A request at the start resolves to the first anchor (the start of the audio data).
+        let first = index.seek_anchor(0);
+        assert_eq!(first.ts_offset, 0);
+        assert_eq!(first.byte_offset, 0);
+
+        // A request at, or beyond, the end resolves to an anchor at, or before, the end rather
+        // than extrapolating past the table. Note the selection backtracks a couple of anchors to
+        // leave reference frames, so it need not be the final anchor.
+        let end = index.seek_anchor(total_ts);
+        let beyond = index.seek_anchor(total_ts + 5_000);
+        assert_eq!(end.ts_offset, beyond.ts_offset);
+        assert_eq!(end.byte_offset, beyond.byte_offset);
+        assert!(end.ts_offset <= total_ts);
+        assert!(end.ts_offset > 0, "a backtracked end anchor should still be well into the stream");
+
+        // The anchor's byte offset matches the corresponding table entry's fraction.
+        let anchor_entry = (end.ts_offset * 100 / total_ts) as usize;
+        let expected = u64::from(toc[anchor_entry]) * audio_byte_len / 256;
+        assert_eq!(end.byte_offset, expected);
+    }
+
+    #[test]
+    fn test_xing_seek_index_anchor_is_at_or_before_request() {
+        // Build a TOC that maps perfectly linearly: entry i stores 256 * i / 100 (rounded down).
+        let mut toc = [0u8; 100];
+        for (i, entry) in toc.iter_mut().enumerate() {
+            *entry = ((i as u64 * 256) / 100).min(255) as u8;
+        }
+
+        let total_ts = 100 * SAMPLES_PER_FRAME;
+        let audio_byte_len = 10_000u64;
+
+        let index = SeekIndex::from_xing_toc(toc, total_ts, audio_byte_len).expect("valid toc");
+
+        // Every selected anchor must lie at, or before, the requested timestamp.
+        for request in (0..=total_ts).step_by(SAMPLES_PER_FRAME as usize) {
+            let anchor = index.seek_anchor(request);
+            assert!(anchor.ts_offset <= request, "anchor past the request");
+        }
+
+        // The anchor selected near the midpoint must be close to the midpoint in bytes. The
+        // selection backtracks a couple of anchors (each spanning 1% of the stream), so allow for
+        // that bounded backtrack plus integer truncation of the table entries.
+        let anchor = index.seek_anchor(total_ts / 2);
+        let half = audio_byte_len / 2;
+        let tolerance = audio_byte_len / 25 + 1;
+        assert!(
+            anchor.byte_offset.abs_diff(half) <= tolerance,
+            "byte_offset={}, half={half}",
+            anchor.byte_offset
+        );
+    }
+
+    #[test]
+    fn test_vbri_seek_index_applies_scale_and_bounds() {
+        let header = test_header();
+
+        // Two raw entries of 100 and 200 with a scale of 2 -> offsets 200 and 400.
+        let raw = [100u32, 200];
+        let total_ts = 4 * SAMPLES_PER_FRAME;
+
+        let index =
+            SeekIndex::from_vbri_entries(&raw, 2, 1, total_ts, &header).expect("valid vbri table");
+
+        // Entry 0 starts at the beginning of the audio, with a scaled byte offset of 200.
+        let first = index.seek_anchor(0);
+        assert_eq!(first.ts_offset, 0);
+        assert_eq!(first.byte_offset, 200);
+
+        // A request at entry 1 backtracks to entry 0 so reference frames remain available.
+        let backtracked = index.seek_anchor(SAMPLES_PER_FRAME);
+        assert_eq!(backtracked.ts_offset, 0);
+        assert_eq!(backtracked.byte_offset, 200);
+
+        // With only two anchors, any request backtracks all the way to the first anchor, which is
+        // the earliest valid seek point.
+        let second_request = 4 * SAMPLES_PER_FRAME;
+        let second = index.seek_anchor(second_request);
+        assert_eq!(second.ts_offset, 0);
+        assert_eq!(second.byte_offset, 200);
+
+        // A request past the last entry does not extrapolate: it resolves to a valid anchor within
+        // the table (here the first anchor, since the two-anchor table always backtracks to it).
+        let clamped = index.seek_anchor(total_ts);
+        assert_eq!(clamped.byte_offset, 200);
+        assert!(clamped.ts_offset <= total_ts);
+
+        // The same anchor is returned for a request far beyond the end of the table.
+        let beyond = index.seek_anchor(total_ts + 10_000);
+        assert_eq!(beyond.byte_offset, clamped.byte_offset);
+
+        // A scale of zero is rejected.
+        assert!(SeekIndex::from_vbri_entries(&raw, 0, 1, total_ts, &header).is_none());
+
+        // A zero first entry is valid because it points to the start of the audio data.
+        assert!(SeekIndex::from_vbri_entries(&[0u32, 200], 2, 1, total_ts, &header).is_some());
+
+        // A non-monotonic table is rejected.
+        assert!(SeekIndex::from_vbri_entries(&[200u32, 100], 1, 1, total_ts, &header).is_none());
+    }
+
+    #[test]
+    fn test_vbri_seek_index_anchor_backtracks() {
+        let header = test_header();
+
+        // Eight entries, one frame apart, with strictly increasing byte offsets.
+        let raw: Vec<u32> = (1..=8).map(|i| i * 100).collect();
+        let total_ts = 8 * SAMPLES_PER_FRAME;
+
+        let index =
+            SeekIndex::from_vbri_entries(&raw, 1, 1, total_ts, &header).expect("valid vbri table");
+
+        // Requesting the last entry must backtrack to leave reference frames before the target, so
+        // the selected anchor is never the final anchor itself.
+        let anchor = index.seek_anchor(total_ts);
+        assert!(anchor.ts_offset < total_ts);
+
+        // Backtracking must never move before the first anchor.
+        let first = index.seek_anchor(0);
+        assert_eq!(first.ts_offset, 0);
+
+        // An anchor is always at, or before, the request.
+        for request in (0..=total_ts).step_by(SAMPLES_PER_FRAME as usize) {
+            assert!(index.seek_anchor(request).ts_offset <= request);
+        }
+    }
+
+    // =========================================================================================
+    // End-to-end coarse seek tests on synthetic VBR streams.
+    // =========================================================================================
+
+    /// Compute the byte size of each frame of the synthetic VBR streams used by the coarse seek
+    /// tests. The first frame uses `first_bitrate`; later frames alternate between `low_bitrate` and
+    /// `high_bitrate`.
+    fn stream_frame_sizes(
+        num_frames: u32,
+        first_bitrate: u32,
+        low_bitrate: u32,
+        high_bitrate: u32,
+    ) -> Vec<u64> {
+        (0..num_frames)
+            .map(|idx| {
+                let bitrate = if idx == 0 {
+                    first_bitrate
+                }
+                else if idx % 2 == 0 {
+                    low_bitrate
+                }
+                else {
+                    high_bitrate
+                };
+                build_frame(bitrate).len() as u64
+            })
+            .collect()
+    }
+
+    /// Build a Xing table of contents that exactly describes a stream with the given frame sizes
+    /// and uniform per-frame duration.
+    fn build_xing_toc(frame_sizes: &[u64]) -> [u8; 100] {
+        let total_bytes: u64 = frame_sizes.iter().sum();
+        let mut offsets = Vec::with_capacity(frame_sizes.len());
+        let mut acc = 0u64;
+        for &size in frame_sizes {
+            offsets.push(acc);
+            acc += size;
+        }
+
+        let num_frames = frame_sizes.len() as u64;
+        let mut toc = [0u8; 100];
+
+        for (i, entry) in toc.iter_mut().enumerate() {
+            // The frame that contains this point in time.
+            let frame_idx = (i as u64 * num_frames / 100).min(num_frames - 1);
+            let byte_pos = offsets[frame_idx as usize];
+            *entry = (256 * byte_pos / total_bytes).min(255) as u8;
+        }
+
+        toc
+    }
+
+    #[test]
+    fn test_coarse_seek_uses_xing_toc() {
+        const NUM_FRAMES: u32 = 24;
+        const FIRST: u32 = 320_000;
+        const LOW: u32 = 32_000;
+        const HIGH: u32 = 160_000;
+
+        let frame_sizes = stream_frame_sizes(NUM_FRAMES, FIRST, LOW, HIGH);
+        let total_audio_bytes: u64 = frame_sizes.iter().sum();
+
+        // A TOC that describes the synthetic stream's actual frame layout.
+        let toc = build_xing_toc(&frame_sizes);
+
+        let mut stream = build_vbr_stream(NUM_FRAMES, FIRST, LOW, HIGH, |frame, _| {
+            insert_xing_tag(frame, NUM_FRAMES, toc);
+        });
+        set_xing_num_bytes(&mut stream, frame_sizes[0] as usize, total_audio_bytes as u32);
+
+        let mut reader = open_reader(stream);
+
+        // The reader must have reconstructed a seek index.
+        assert!(reader.seek_index.is_some(), "a xing seek index should be present");
+
+        // Seek to the middle of the stream using coarse mode.
+        let target_ts = (NUM_FRAMES as u64 / 2) * SAMPLES_PER_FRAME;
+
+        let seeked = reader
+            .seek(
+                SeekMode::Coarse,
+                SeekTo::Timestamp { ts: Timestamp::new(target_ts as i64), track_id: 0 },
+            )
+            .expect("coarse seek should succeed");
+
+        // The actual timestamp must be at or before the requested timestamp.
+        assert!(
+            seeked.actual_ts.get() <= target_ts as i64,
+            "actual_ts={} should be <= target={target_ts}",
+            seeked.actual_ts
+        );
+
+        // Since the TOC accurately describes the stream, the seek must land within a few frames of
+        // the target rather than being thrown off by the large bitrate differences between frames.
+        let error = target_ts.abs_diff(seeked.actual_ts.get() as u64);
+        assert!(error <= 3 * SAMPLES_PER_FRAME, "seek error too large: {error}");
+
+        // The packet following the seek must be decodable: it must begin with a valid sync word.
+        let packet = reader.next_packet().expect("a packet should be available").unwrap();
+        assert!(header::is_frame_header_word_synced(u32::from_be_bytes(
+            packet.data[0..4].try_into().unwrap()
+        )));
+    }
+
+    #[test]
+    fn test_coarse_seek_uses_vbri_table() {
+        const NUM_FRAMES: u32 = 16;
+        const FIRST: u32 = 320_000;
+        const LOW: u32 = 32_000;
+        const HIGH: u32 = 160_000;
+        const FRAMES_PER_ENTRY: u16 = 2;
+
+        let frame_sizes = stream_frame_sizes(NUM_FRAMES, FIRST, LOW, HIGH);
+
+        // One entry per two frames: the byte offset at the start of every second frame. Offsets are
+        // relative to the start of the audio data, and entry 0 therefore starts at zero.
+        let num_entries = NUM_FRAMES / u32::from(FRAMES_PER_ENTRY);
+        let mut entries = Vec::with_capacity(num_entries as usize);
+        let mut acc: u32 = 0;
+        for i in 0..num_entries {
+            if i > 0 {
+                let base = (i * 2) as usize;
+                acc += (frame_sizes[base - 2] + frame_sizes[base - 1]) as u32;
+            }
+            entries.push(acc);
+        }
+
+        let stream = build_vbr_stream(NUM_FRAMES, FIRST, LOW, HIGH, |frame, _| {
+            insert_vbri_tag(
+                frame,
+                NUM_FRAMES,
+                num_entries as u16,
+                1,
+                4,
+                FRAMES_PER_ENTRY,
+                &entries,
+            );
+        });
+
+        let mut reader = open_reader(stream);
+
+        assert!(reader.seek_index.is_some(), "a vbri seek index should be present");
+
+        // Seek to roughly the three-quarter point.
+        let target_ts = (NUM_FRAMES as u64 * 3 / 4) * SAMPLES_PER_FRAME;
+
+        let seeked = reader
+            .seek(
+                SeekMode::Coarse,
+                SeekTo::Timestamp { ts: Timestamp::new(target_ts as i64), track_id: 0 },
+            )
+            .expect("coarse seek should succeed");
+
+        assert!(seeked.actual_ts.get() <= target_ts as i64);
+
+        let error = target_ts.abs_diff(seeked.actual_ts.get() as u64);
+        // The table groups two frames per entry, so allow a few frames of residual error.
+        assert!(error <= 4 * SAMPLES_PER_FRAME, "seek error too large: {error}");
+
+        // The next packet must be a valid frame.
+        let packet = reader.next_packet().expect("a packet should be available").unwrap();
+        assert!(header::is_frame_header_word_synced(u32::from_be_bytes(
+            packet.data[0..4].try_into().unwrap()
+        )));
+    }
+
+    #[test]
+    fn test_coarse_seek_falls_back_without_index() {
+        const NUM_FRAMES: u32 = 40;
+        const FIRST: u32 = 320_000;
+        const LOW: u32 = 64_000;
+        const HIGH: u32 = 128_000;
+
+        // A plain VBR stream with no Xing/Info or VBRI tag in the first frame.
+        let stream = build_vbr_stream(NUM_FRAMES, FIRST, LOW, HIGH, |_, _| {});
+
+        let mut reader = open_reader(stream);
+
+        // No seek index is available, so the linear estimation path must be used.
+        assert!(reader.seek_index.is_none());
+
+        // The duration must be estimated since no tag is present.
+        assert!(reader.tracks()[0].num_frames.is_some(), "duration should be estimated");
+
+        let target_ts = (NUM_FRAMES as u64 / 2) * SAMPLES_PER_FRAME;
+
+        let seeked = reader
+            .seek(
+                SeekMode::Coarse,
+                SeekTo::Timestamp { ts: Timestamp::new(target_ts as i64), track_id: 0 },
+            )
+            .expect("coarse seek should succeed using the fallback");
+
+        // The fallback may overshoot in coarse mode, but the reader must still produce packets
+        // whose timestamps progress forward from the reported position.
+        let first = reader.next_packet().expect("a packet should be available").unwrap();
+        assert_eq!(first.pts, seeked.actual_ts);
+
+        let second = reader.next_packet().expect("a second packet should be available").unwrap();
+        assert!(second.pts > first.pts);
+    }
+
+    #[test]
+    fn test_seek_stays_within_valid_audio_bounds() {
+        const NUM_FRAMES: u32 = 16;
+        const FIRST: u32 = 320_000;
+        const LOW: u32 = 32_000;
+        const HIGH: u32 = 160_000;
+
+        let frame_sizes = stream_frame_sizes(NUM_FRAMES, FIRST, LOW, HIGH);
+        let toc = build_xing_toc(&frame_sizes);
+
+        let stream = build_vbr_stream(NUM_FRAMES, FIRST, LOW, HIGH, |frame, _| {
+            insert_xing_tag(frame, NUM_FRAMES, toc);
+        });
+
+        let mut reader = open_reader(stream);
+        let max_ts = reader.tracks()[0]
+            .num_frames
+            .map(|n| Timestamp::new(n as i64))
+            .expect("duration should be known");
+
+        // Seek near the end of the valid audio range; it must succeed and never run past the end.
+        let near_end = max_ts.saturating_sub(Duration::from(2 * SAMPLES_PER_FRAME));
+
+        let seeked = reader
+            .seek(SeekMode::Coarse, SeekTo::Timestamp { ts: near_end, track_id: 0 })
+            .expect("seek near the end should succeed");
+
+        assert!(seeked.actual_ts <= max_ts, "seeked past the valid audio range");
+
+        // Seeking beyond the valid range is rejected.
+        let result = reader.seek(
+            SeekMode::Coarse,
+            SeekTo::Timestamp {
+                ts: max_ts.checked_add(Duration::from(SAMPLES_PER_FRAME)).unwrap(),
+                track_id: 0,
+            },
+        );
+        assert!(matches!(result, Err(Error::SeekError(SeekErrorKind::OutOfRange))));
+    }
+
+    #[test]
+    fn test_accurate_seek_unaffected_by_index() {
+        const NUM_FRAMES: u32 = 12;
+        const FIRST: u32 = 320_000;
+        const LOW: u32 = 32_000;
+        const HIGH: u32 = 160_000;
+
+        let frame_sizes = stream_frame_sizes(NUM_FRAMES, FIRST, LOW, HIGH);
+        let toc = build_xing_toc(&frame_sizes);
+
+        let stream = build_vbr_stream(NUM_FRAMES, FIRST, LOW, HIGH, |frame, _| {
+            insert_xing_tag(frame, NUM_FRAMES, toc);
+        });
+
+        let mut reader = open_reader(stream);
+
+        // Accurate seeks must ignore the coarse seek index and count frames from the start, so the
+        // reported position is exact.
+        let target_frame = NUM_FRAMES / 2;
+        let target_ts = u64::from(target_frame) * SAMPLES_PER_FRAME;
+
+        let seeked = reader
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::Timestamp { ts: Timestamp::new(target_ts as i64), track_id: 0 },
+            )
+            .expect("accurate seek should succeed");
+
+        assert_eq!(seeked.actual_ts.get(), target_ts as i64);
     }
 }
