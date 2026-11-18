@@ -736,13 +736,48 @@ macro_rules! map_std_uint {
 pub struct IlstAtom {
     /// Metadata revision.
     pub metadata: MetadataRevision,
+    /// The raw value of the iTunes `com.apple.iTunes:iTunSMPB` freeform gapless tag, if present.
+    pub itunes_gapless: Option<Box<[u8]>>,
 }
+
+/// The mean (namespace) value identifying iTunes freeform tags.
+const ITUNES_MEAN: &str = "com.apple.iTunes";
+/// The name of the iTunes seamless playback (gapless) freeform tag.
+const ITUNES_GAPLESS_NAME: &str = "iTunSMPB";
 
 impl Atom for IlstAtom {
     fn read<R: ReadAtom>(it: &mut AtomIterator<R>, _header: &AtomHeader) -> Result<Self> {
         let mut mb = MetadataBuilder::new(ISOMP4_METADATA_INFO);
+        let mut itunes_gapless = None;
 
         while let Some(header) = it.next_header()? {
+            // Capture the iTunes gapless freeform tag before the generic freeform handling so the
+            // raw value remains available for gapless decoding.
+            if header.atom_type == AtomType::FreeFormTag {
+                let tag = it.read_atom::<MetaTagAtom>()?;
+
+                let is_gapless_tag =
+                    tag.mean.as_ref().map(|m| m.value == ITUNES_MEAN).unwrap_or(false)
+                        && tag.name.as_ref().map(|n| n.value == ITUNES_GAPLESS_NAME).unwrap_or(false);
+
+                if is_gapless_tag {
+                    if let Some(value) = tag.values.first() {
+                        itunes_gapless = Some(value.data.clone());
+                    }
+                }
+
+                for value_atom in tag.values.iter() {
+                    if let Some(value) = parse_tag_value(value_atom.data_type, &value_atom.data) {
+                        let _ = itunes::parse_itunes_tag(tag.full_name(), value, &mut mb);
+                    }
+                    else {
+                        warn!("unsupported data type {:?} for freeform tag", value_atom.data_type);
+                    }
+                }
+
+                continue;
+            }
+
             // Ignore standard atoms, check if other is a metadata atom.
             match &header.atom_type {
                 AtomType::AdvisoryTag => add_advisory_tag(it, &mut mb)?,
@@ -937,7 +972,7 @@ impl Atom for IlstAtom {
             }
         }
 
-        Ok(IlstAtom { metadata: mb.build() })
+        Ok(IlstAtom { metadata: mb.build(), itunes_gapless })
     }
 }
 

@@ -363,7 +363,7 @@ fn run_test(path: &Path, opts: &TestOptions, result: &mut TestResult) -> Result<
     let tgt_ms = Box::new(File::open(path)?);
     let tgt_mss = MediaSourceStream::new(tgt_ms, Default::default());
 
-    let tgt_fmt_opts = Default::default();
+    let tgt_fmt_opts = FormatOptions::default().gapless(opts.gapless);
     let tgt_dec_opts = AudioDecoderOptions::default().gapless(opts.gapless);
 
     let mut tgt_inst = DecoderInstance::try_open(tgt_mss, tgt_fmt_opts, tgt_dec_opts)?;

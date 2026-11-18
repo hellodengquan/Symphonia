@@ -174,7 +174,7 @@ fn run(args: &ArgMatches) -> Result<i32> {
     let mss = MediaSourceStream::new(source, Default::default());
 
     // Use the default options for format readers other than for gapless playback.
-    let fmt_opts: FormatOptions = Default::default();
+    let fmt_opts = FormatOptions::default().gapless(!args.get_flag("no-gapless"));
 
     // Use the default options for metadata readers.
     let meta_opts: MetadataOptions = Default::default();

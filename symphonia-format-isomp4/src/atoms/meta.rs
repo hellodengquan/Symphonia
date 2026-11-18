@@ -16,6 +16,8 @@ use crate::atoms::{Atom, AtomHeader, AtomIterator, AtomType, IlstAtom, ReadAtom,
 pub struct MetaAtom {
     /// Metadata revision.
     pub metadata: Option<MetadataRevision>,
+    /// The raw iTunes gapless (`iTunSMPB`) tag value, if present.
+    pub itunes_gapless: Option<Box<[u8]>>,
 }
 
 impl Debug for MetaAtom {
@@ -37,17 +39,20 @@ impl Atom for MetaAtom {
         let (_, _) = it.read_extended_header()?;
 
         let mut metadata = None;
+        let mut itunes_gapless = None;
 
         while let Some(header) = it.next_header()? {
             match header.atom_type {
                 AtomType::MetaList => {
-                    metadata = Some(it.read_atom::<IlstAtom>()?.metadata);
+                    let ilst = it.read_atom::<IlstAtom>()?;
+                    itunes_gapless = ilst.itunes_gapless;
+                    metadata = Some(ilst.metadata);
                 }
                 // TODO: Support country and language lists.
                 _ => (),
             }
         }
 
-        Ok(MetaAtom { metadata })
+        Ok(MetaAtom { metadata, itunes_gapless })
     }
 }

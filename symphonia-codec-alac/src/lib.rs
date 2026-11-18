@@ -275,10 +275,12 @@ pub struct AlacDecoder {
     config: MagicCookie,
     /// Output buffer.
     buf: AudioBuffer<i32>,
+    /// Decoder options.
+    opts: AudioDecoderOptions,
 }
 
 impl AlacDecoder {
-    pub fn try_new(params: &AudioCodecParameters, _opts: &AudioDecoderOptions) -> Result<Self> {
+    pub fn try_new(params: &AudioCodecParameters, opts: &AudioDecoderOptions) -> Result<Self> {
         // Verify codec ID.
         if params.codec != CODEC_ID_ALAC {
             return unsupported_error("alac: invalid codec");
@@ -310,7 +312,13 @@ impl AlacDecoder {
         params.with_sample_rate(cookie.sample_rate);
         params.with_bits_per_sample(u32::from(cookie.bit_depth));
 
-        Ok(AlacDecoder { params, tail_bits: vec![0; max_tail_values], buf, config: cookie })
+        Ok(AlacDecoder {
+            params,
+            tail_bits: vec![0; max_tail_values],
+            buf,
+            config: cookie,
+            opts: *opts,
+        })
     }
 
     fn decode_inner(&mut self, packet: &PacketRef<'_>) -> Result<()> {
@@ -413,6 +421,11 @@ impl AlacDecoder {
 
         if shift > 0 {
             self.buf.apply(|sample| sample << shift);
+        }
+
+        // Trim encoder delay and padding frames when gapless playback is enabled.
+        if self.opts.gapless {
+            self.buf.trim(packet.trim_start.get() as usize, packet.trim_end.get() as usize);
         }
 
         Ok(())

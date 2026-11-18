@@ -138,6 +138,18 @@ pub struct FormatOptions {
     /// a good compromise for casual playback of music, podcasts, movies, etc. However, for
     /// highly-interactive applications, this value should be decreased.
     pub seek_index_fill_period_ms: u16,
+    /// Enable support for gapless playback.
+    ///
+    /// When enabled, a format reader will use any container-provided information, such as edit
+    /// lists or encoder delay/padding metadata, to define the valid audio region of a track. The
+    /// timestamps and durations of the packets will then describe only the valid (non-discarded)
+    /// frames, and any encoder delay or padding frames are signalled with packet trim fields.
+    ///
+    /// When disabled, the format reader preserves its original behaviour and yields every sample
+    /// stored in the container without any gapless-related adjustment.
+    ///
+    /// Default: `true`.
+    pub gapless: bool,
     /// External, supplementary, data related to the media container read before the start of the
     /// container, or provided through some other side-channel.
     pub external_data: ExternalFormatData,
@@ -161,6 +173,7 @@ impl Default for FormatOptions {
         FormatOptions {
             prebuild_seek_index: false,
             seek_index_fill_period_ms: 1000,
+            gapless: true,
             external_data: Default::default(),
         }
     }
@@ -188,6 +201,16 @@ impl FormatOptions {
     /// highly-interactive applications, this value should be decreased.
     pub fn seek_index_fill_period_ms(mut self, period: u16) -> Self {
         self.seek_index_fill_period_ms = period;
+        self
+    }
+
+    /// Enable or disable support for gapless playback.
+    ///
+    /// See the documentation for the [`FormatOptions::gapless`] field for details.
+    ///
+    /// Default: `true`.
+    pub fn gapless(mut self, enable: bool) -> Self {
+        self.gapless = enable;
         self
     }
 }

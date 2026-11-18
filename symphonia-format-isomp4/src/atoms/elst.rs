@@ -11,20 +11,23 @@ use crate::atoms::{Atom, AtomHeader, AtomIterator, ReadAtom, Result};
 use crate::atoms::{decode_error, limits::*};
 
 /// Edit list entry.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ElstEntry {
-    segment_duration: u64,
-    media_time: i64,
-    media_rate_int: i16,
-    media_rate_frac: i16,
+    /// The duration of the edit in the movie (track header) timescale.
+    pub segment_duration: u64,
+    /// The starting time within the media of this edit, in the media timescale. A value of -1
+    /// indicates an empty edit (silence/blank).
+    pub media_time: i64,
+    /// The integer part of the media rate. A value of 1 indicates a normal, forward rate.
+    pub media_rate_int: i16,
+    /// The fractional part of the media rate. A value of 0 indicates an integer media rate.
+    pub media_rate_frac: i16,
 }
 
 /// Edit list atom.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ElstAtom {
-    entries: Vec<ElstEntry>,
+    pub entries: Vec<ElstEntry>,
 }
 
 impl Atom for ElstAtom {

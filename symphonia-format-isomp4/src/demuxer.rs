@@ -16,6 +16,7 @@ use symphonia_core::formats::probe::{ProbeFormatData, ProbeableFormat, Score, Sc
 use symphonia_core::formats::well_known::FORMAT_ID_ISOMP4;
 use symphonia_core::io::*;
 use symphonia_core::meta::{Metadata, MetadataLog};
+use symphonia_core::packet::PacketBuilder;
 use symphonia_core::units::Time;
 
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 
 use crate::atoms::{AtomError, AtomIterator, AtomType, ReadAtom};
 use crate::atoms::{FtypAtom, MetaAtom, MoofAtom, MoovAtom, SidxAtom, TrakAtom};
+use crate::edit::GaplessInfo;
 use crate::stream::*;
 
 use log::{debug, info, trace, warn};
@@ -46,10 +48,55 @@ pub struct TrackState {
     next_sample: u32,
     /// The current sample byte position relative to the start of the track.
     next_sample_pos: u64,
+    /// Gapless playback information for the track, if available.
+    gapless: Option<TrackGapless>,
+}
+
+/// Per-track gapless playback state.
+///
+/// The demuxer internally iterates over samples using their media timeline (the `stts` atom
+/// timestamps). When gapless playback is enabled, outgoing packets are translated onto the
+/// presentation timeline, where the first valid frame has a timestamp of 0 and encoder delay
+/// frames have negative timestamps.
+#[derive(Clone, Debug)]
+struct TrackGapless {
+    /// The media time of the first presented (valid) frame.
+    start_media_time: u64,
+    /// The media time immediately after the last presented (valid) frame.
+    end_media_time: u64,
+}
+
+impl TrackGapless {
+    /// The number of valid (presented) frames in the track.
+    fn valid_duration(&self) -> u64 {
+        self.end_media_time - self.start_media_time
+    }
+
+    /// Translate a media timeline timestamp onto the presentation timeline.
+    ///
+    /// Valid frames receive non-negative timestamps starting at 0, while encoder delay frames
+    /// receive negative timestamps. Saturates if the media timestamp cannot be represented.
+    fn media_ts_to_presentation(&self, media_ts: u64) -> Timestamp {
+        let offset = i64::try_from(self.start_media_time).unwrap_or(i64::MAX);
+        let media_ts = i64::try_from(media_ts).unwrap_or(i64::MAX);
+        Timestamp::new(media_ts.saturating_sub(offset))
+    }
+
+    /// Translate a presentation timeline timestamp back onto the media timeline.
+    fn presentation_ts_to_media(&self, presentation_ts: i64) -> u64 {
+        let offset = i64::try_from(self.start_media_time).unwrap_or(i64::MAX);
+        presentation_ts.saturating_add(offset).max(0) as u64
+    }
 }
 
 impl TrackState {
-    pub fn make(track_num: usize, trak: &TrakAtom, timespan: &TimeSpan) -> (Self, Track) {
+    pub fn make(
+        track_num: usize,
+        trak: &TrakAtom,
+        timespan: &TimeSpan,
+        gapless: Option<GaplessInfo>,
+        gapless_enabled: bool,
+    ) -> (Self, Track) {
         let mut track = Track::new(trak.tkhd.id);
 
         // Create the codec parameters using the sample description atom.
@@ -74,12 +121,51 @@ impl TrackState {
             }
         }
 
+        let state_gapless = if gapless_enabled {
+            gapless.and_then(|info| {
+                let total_media_duration = trak.mdia.minf.stbl.stts.total_duration;
+                let padding = info.padding(total_media_duration);
+
+                // The information must fit in the packet trim fields and describe a valid region.
+                let delay = u32::try_from(info.delay()).ok()?;
+                let padding = u32::try_from(padding).ok()?;
+                let end_media_time =
+                    info.start_media_time.checked_add(info.valid_duration)?;
+
+                if info.valid_duration == 0 || end_media_time > total_media_duration {
+                    return None;
+                }
+
+                // Expose the encoder delay and padding on the track.
+                track.with_delay(delay);
+                track.with_padding(padding);
+
+                // The track's duration and number of frames describe the valid audio only.
+                let valid_duration = Duration::new(info.valid_duration);
+                track.with_duration(valid_duration);
+
+                if let Some(CodecParameters::Audio(audio)) = &track.codec_params {
+                    if let Some(sample_rate) = audio.sample_rate {
+                        if sample_rate == timespan.timescale.get() {
+                            track.with_num_frames(info.valid_duration);
+                        }
+                    }
+                }
+
+                Some(TrackGapless { start_media_time: info.start_media_time, end_media_time })
+            })
+        }
+        else {
+            None
+        };
+
         let state = Self {
             track_num,
             track_id: trak.tkhd.id,
             cur_seg: 0,
             next_sample: 0,
             next_sample_pos: 0,
+            gapless: state_gapless,
         };
 
         (state, track)
@@ -152,6 +238,7 @@ impl<'s> IsoMp4Reader<'s> {
         // To get to beginning of the atom.
         mss.seek_buffered_rel(-4);
 
+        let gapless_enabled = opts.gapless;
         let is_seekable = mss.is_seekable();
 
         let mut ftyp = None;
@@ -284,6 +371,14 @@ impl<'s> IsoMp4Reader<'s> {
             }
         }
 
+        // Capture the iTunes gapless tag before the metadata revision is consumed. Edit lists
+        // always take priority over the iTunes tag, so this is only used as a fallback.
+        let itunes_gapless = moov
+            .udta
+            .as_ref()
+            .and_then(|udta| udta.meta.as_ref())
+            .and_then(|meta| meta.itunes_gapless.clone());
+
         if let Some(rev) = moov.take_metadata() {
             metadata.push(rev);
         }
@@ -306,16 +401,29 @@ impl<'s> IsoMp4Reader<'s> {
             }
             else {
                 // If non-fragmented, use the total duration (media timescale) from the track's
-                // stts atom. Since edits are not currently supported, this is the duration of all
-                // samples that will be yielded.
-                //
-                // TODO: Support edits. Once supported, prefer the tkhd duration.
+                // stts atom. When gapless playback is enabled, the track's duration may be further
+                // restricted to the valid audio region described by an edit list or iTunes
+                // gapless metadata.
                 let duration = Duration::from(trak.mdia.minf.stbl.stts.total_duration);
 
                 TimeSpan::new(trak.mdia.mdhd.timescale, duration)
             };
 
-            let (track_state, track) = TrackState::make(t, trak, &timespan);
+            // Resolve the gapless information for non-fragmented audio tracks. Fragmented streams
+            // do not use the classic stts-based sample timing that the gapless logic relies on.
+            let gapless = if gapless_enabled && !moov.is_fragmented() {
+                crate::edit::resolve_gapless_info(
+                    trak,
+                    itunes_gapless.as_deref(),
+                    moov.mvhd.timescale.get(),
+                )
+            }
+            else {
+                None
+            };
+
+            let (track_state, track) =
+                TrackState::make(t, trak, &timespan, gapless, gapless_enabled);
 
             tracks.push(track);
             track_states.push(track_state);
@@ -358,10 +466,19 @@ impl<'s> IsoMp4Reader<'s> {
             for (seg_idx_delta, seg) in self.segs[state.cur_seg..].iter().enumerate() {
                 // Try to get the timestamp for the next sample of the track from the segment.
                 if let Some(timing) = seg.sample_timing(state.track_num, state.next_sample)? {
-                    // Calculate the presentation time using the timestamp.
-                    let Some(ts) = timing.ts.try_into().ok()
-                    else {
-                        return Ok(None);
+                    // The segment timestamp is on the media timeline. If gapless playback is
+                    // enabled for this track, translate it onto the presentation timeline so that
+                    // encoder delay frames have negative timestamps and the first valid frame has
+                    // a timestamp of 0.
+                    let ts = match &state.gapless {
+                        Some(gapless) => gapless.media_ts_to_presentation(timing.ts),
+                        None => {
+                            let Ok(ts) = Timestamp::try_from(timing.ts)
+                            else {
+                                return Ok(None);
+                            };
+                            ts
+                        }
                     };
 
                     let Some(sample_time) = tb.calc_time(ts)
@@ -522,13 +639,32 @@ impl<'s> IsoMp4Reader<'s> {
             return seek_error(SeekErrorKind::OutOfRange);
         }
 
+        // Gapless tracks address the media using presentation timestamps (the first valid frame
+        // is at timestamp 0). Translate the requested timestamp onto the media timeline before
+        // locating the containing sample, and reject seeks beyond the valid audio region.
+        let gapless = self.track_states[track_num].gapless.clone();
+
+        let media_ts = if let Some(gapless) = &gapless {
+            let max_presentation_ts =
+                i64::try_from(gapless.valid_duration()).unwrap_or(i64::MAX);
+
+            if ts.get() > max_presentation_ts {
+                return seek_error(SeekErrorKind::OutOfRange);
+            }
+
+            gapless.presentation_ts_to_media(ts.get())
+        }
+        else {
+            ts.get() as u64
+        };
+
         let mut seg_skip = 0;
 
         let seek_loc = 'locate: loop {
             // Iterate over all segments and attempt to find the segment and sample number that
             // contains the desired timestamp. Skip segments already examined.
             for (seg_idx, seg) in self.segs.iter().enumerate().skip(seg_skip) {
-                if let Some(sample_num) = seg.ts_sample(track_num, ts.get() as u64)? {
+                if let Some(sample_num) = seg.ts_sample(track_num, media_ts)? {
                     break 'locate SeekLocation { seg_idx, sample_num };
                 }
 
@@ -550,10 +686,16 @@ impl<'s> IsoMp4Reader<'s> {
             None => return seek_error(SeekErrorKind::OutOfRange),
         };
 
-        // Try to convert the sample timing to a timestamp.
-        let actual_ts = match Timestamp::try_from(timing.ts) {
-            Ok(ts) => ts,
-            _ => return seek_error(SeekErrorKind::OutOfRange),
+        // Translate the actual sample position back onto the presentation timeline reported to
+        // the caller.
+        let actual_ts = match &gapless {
+            Some(gapless) => gapless.media_ts_to_presentation(timing.ts),
+            None => {
+                match Timestamp::try_from(timing.ts) {
+                    Ok(ts) => ts,
+                    _ => return seek_error(SeekErrorKind::OutOfRange),
+                }
+            }
         };
 
         // Get the sample information.
@@ -652,12 +794,46 @@ impl FormatReader for IsoMp4Reader<'_> {
         let data =
             self.iter.read_raw_boxed_slice_exact(sample_info.pos, sample_info.len as usize)?;
 
-        Ok(Some(Packet::new(
-            next_sample_info.track_id,
-            next_sample_info.ts,
-            next_sample_info.dur,
-            data,
-        )))
+        let block_dur = next_sample_info.dur;
+
+        // When gapless playback is enabled for this track, calculate the encoder delay/padding
+        // trims for the packet based on its position within the media timeline.
+        let gapless = self.track_states[next_sample_info.track_num].gapless.as_ref();
+
+        let Some(gapless) = gapless
+        else {
+            // No gapless information: preserve the original untrimmed output.
+            return Ok(Some(Packet::new(next_sample_info.track_id, next_sample_info.ts, block_dur, data)));
+        };
+
+        // Recover the media timeline span of this sample from its presentation timestamp.
+        let media_start = gapless.presentation_ts_to_media(next_sample_info.ts.get());
+        let media_end = media_start.saturating_add(block_dur.get());
+
+        // Frames before the valid region are encoder delay and are trimmed from the start.
+        let trim_start =
+            gapless.start_media_time.saturating_sub(media_start).min(block_dur.get());
+
+        // Frames after the valid region are encoder padding and are trimmed from the end.
+        let trim_end = media_end
+            .saturating_sub(gapless.end_media_time)
+            .min(block_dur.get() - trim_start);
+
+        let valid_dur = block_dur
+            .checked_sub(Duration::new(trim_start))
+            .and_then(|dur| dur.checked_sub(Duration::new(trim_end)))
+            .unwrap_or(Duration::ZERO);
+
+        let packet = PacketBuilder::new()
+            .track_id(next_sample_info.track_id)
+            .pts(next_sample_info.ts)
+            .dur(valid_dur)
+            .trim_start(Duration::new(trim_start))
+            .trim_end(Duration::new(trim_end))
+            .data(data)
+            .build();
+
+        Ok(Some(packet))
     }
 
     fn metadata(&mut self) -> Metadata<'_> {
