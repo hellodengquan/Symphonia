@@ -21,6 +21,7 @@ use symphonia_core::units::TimeBase;
 use log::{info, warn};
 
 use crate::codecs::make_track_codec_params;
+use crate::content_encoding::{ContentDecoders, decode_content};
 use crate::ebml::{EbmlElementInfo, EbmlError, EbmlIterator, EbmlSchema, ReadEbml};
 use crate::lacing::{Frame, extract_frames};
 use crate::schema::{MkvElement, MkvSchema};
@@ -44,6 +45,8 @@ pub struct TrackState {
     pub(crate) track_time_base: TimeBase,
     /// The track's timestamp scale.
     pub(crate) track_timestamp_scale: f64,
+    /// The content decoders for reversing the track's declared content encodings.
+    pub(crate) content_decoders: ContentDecoders,
 }
 
 /// Matroska (MKV) and WebM demultiplexer.
@@ -281,6 +284,20 @@ impl<'s> MkvReader<'s> {
         let mut track_states = HashMap::new();
 
         for track in segment_tracks.tracks {
+            // Build the content decoders for the track from its declared content encodings.
+            let content_decoders = ContentDecoders::new(&track.content_encodings);
+
+            // If content encodings apply to the codec private data, restore it before it is
+            // used to build the codec parameters.
+            let mut track = track;
+            if let ContentDecoders::Supported { private, .. } = &content_decoders {
+                if !private.is_empty() {
+                    if let Some(codec_private) = track.codec_private.take() {
+                        track.codec_private = Some(decode_content(private, &codec_private));
+                    }
+                }
+            }
+
             // The track's timebase is scaled by the track timestamp scale.
             let track_time_base = time_base
                 .scale(track.track_timestamp_scale)
@@ -295,6 +312,7 @@ impl<'s> MkvReader<'s> {
                 codec_delay: track.codec_delay,
                 track_time_base,
                 track_timestamp_scale: track.track_timestamp_scale,
+                content_decoders,
             };
 
             // Create the track.
@@ -311,7 +329,17 @@ impl<'s> MkvReader<'s> {
 
             tr.with_flags(track.flags);
 
-            if let Some(codec_params) = make_track_codec_params(track)? {
+            // A track declaring an encryption or an unsupported compression cannot be decoded.
+            // Do not populate its codec parameters so that the track cannot be opened for
+            // decoding. Its frames will not be delivered either.
+            if state.content_decoders.is_unsupported() {
+                warn!(
+                    "mkv: track {} uses an unsupported content encoding; the track cannot be \
+                     decoded",
+                    state.track_num
+                );
+            }
+            else if let Some(codec_params) = make_track_codec_params(track)? {
                 tr.with_codec_params(codec_params);
             }
 
@@ -634,6 +662,22 @@ impl FormatReader for MkvReader<'_> {
     fn next_packet(&mut self) -> Result<Option<Packet>> {
         loop {
             if let Some(frame) = self.frames.pop_front() {
+                // Frames of tracks declaring an unsupported content encoding (encryption, or
+                // an unsupported compression) must not be delivered since they cannot be
+                // decoded. Report the track as unsupported instead. This error is
+                // recoverable: the next call will continue with the following frame, so other
+                // tracks of the same file remain readable.
+                if self
+                    .track_states
+                    .get(&frame.track_num)
+                    .is_some_and(|state| state.content_decoders.is_unsupported())
+                {
+                    return unsupported_error(
+                        "mkv: track uses an unsupported content encoding (encryption or \
+                         compression)",
+                    );
+                }
+
                 return Ok(Some(Packet::new(
                     frame.track_num,
                     frame.pts.into_ts(),

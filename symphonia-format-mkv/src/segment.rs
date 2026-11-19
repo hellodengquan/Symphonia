@@ -359,6 +359,7 @@ pub(crate) struct TrackElement {
     pub(crate) codec_id: String,
     pub(crate) codec_private: Option<Box<[u8]>>,
     pub(crate) codec_delay: MatroskaTicks,
+    pub(crate) content_encodings: Vec<ContentEncodingElement>,
     pub(crate) block_addition_mappings: Vec<BlockAdditionMappingElement>,
     pub(crate) audio: Option<AudioElement>,
     pub(crate) video: Option<VideoElement>,
@@ -383,6 +384,7 @@ impl EbmlElement<MkvSchema> for TrackElement {
         let mut codec_id = None;
         let mut codec_private = None;
         let mut codec_delay = None;
+        let mut content_encodings = Vec::new();
         let mut default_duration = None;
         let mut default_decoded_field_duration = None;
         let mut track_timestamp_scale = None;
@@ -424,6 +426,11 @@ impl EbmlElement<MkvSchema> for TrackElement {
                 MkvElement::CodecDelay => {
                     // Mandatory element. Schema-defined default is 0.
                     codec_delay = it.read_u64()?.map(MatroskaTicks);
+                }
+                MkvElement::ContentEncodings => {
+                    // Non-mandatory element.
+                    content_encodings =
+                        it.read_master_element::<ContentEncodingsElement>()?.encodings;
                 }
                 MkvElement::Audio => {
                     // Non-mandatory element.
@@ -526,6 +533,7 @@ impl EbmlElement<MkvSchema> for TrackElement {
             codec_id: codec_id.ok_or(EbmlError::ElementError("mkv: missing codec id"))?,
             codec_private,
             codec_delay,
+            content_encodings,
             block_addition_mappings,
             audio,
             video,
@@ -713,6 +721,127 @@ impl EbmlElement<MkvSchema> for BlockAdditionMappingElement {
         }
 
         Ok(Self { extra_data })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ContentEncodingsElement {
+    pub(crate) encodings: Vec<ContentEncodingElement>,
+}
+
+impl EbmlElement<MkvSchema> for ContentEncodingsElement {
+    const TYPE: MkvElement = MkvElement::ContentEncodings;
+
+    fn read<R: ReadEbml>(it: &mut MkvEbmlIterator<R>, hdr: &MkvEbmlElementHeader) -> Result<Self> {
+        let mut encodings = Vec::new();
+
+        while let Some(child) = it.next_header()? {
+            match child.element_type() {
+                MkvElement::ContentEncoding => {
+                    // Mandatory element.
+                    encodings.push(it.read_master_element()?);
+                }
+                other => {
+                    // Unexpected child element.
+                    log::debug!("ignored {:?} child {:?}", hdr.element_type(), other);
+                }
+            }
+        }
+
+        Ok(Self { encodings })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ContentEncodingElement {
+    pub(crate) order: u64,
+    pub(crate) scope: u64,
+    pub(crate) encoding_type: u64,
+    pub(crate) compression: Option<ContentCompressionElement>,
+    pub(crate) has_encryption: bool,
+}
+
+impl EbmlElement<MkvSchema> for ContentEncodingElement {
+    const TYPE: MkvElement = MkvElement::ContentEncoding;
+
+    fn read<R: ReadEbml>(it: &mut MkvEbmlIterator<R>, hdr: &MkvEbmlElementHeader) -> Result<Self> {
+        let mut order = None;
+        let mut scope = None;
+        let mut encoding_type = None;
+        let mut compression = None;
+        let mut has_encryption = false;
+
+        while let Some(child) = it.next_header()? {
+            match child.element_type() {
+                MkvElement::ContentEncodingOrder => {
+                    // Mandatory element. No schema-defined default.
+                    order = Some(it.read_u64_no_default()?);
+                }
+                MkvElement::ContentEncodingScope => {
+                    // Mandatory element. Schema-defined default is 1 (block).
+                    scope = it.read_u64()?;
+                }
+                MkvElement::ContentEncodingType => {
+                    // Mandatory element. Schema-defined default is 0 (compression).
+                    encoding_type = it.read_u64()?;
+                }
+                MkvElement::ContentCompression => {
+                    // Non-mandatory element.
+                    compression = Some(it.read_master_element()?);
+                }
+                MkvElement::ContentEncryption => {
+                    // Non-mandatory element. Encryption is not supported, only record its
+                    // presence. The element's children are skipped.
+                    has_encryption = true;
+                }
+                other => {
+                    // Unexpected child element.
+                    log::debug!("ignored {:?} child {:?}", hdr.element_type(), other);
+                }
+            }
+        }
+
+        Ok(Self {
+            order: order.ok_or(EbmlError::ElementError("mkv: missing content encoding order"))?,
+            scope: scope.unwrap_or(1),
+            encoding_type: encoding_type.unwrap_or(0),
+            compression,
+            has_encryption,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ContentCompressionElement {
+    pub(crate) algo: u64,
+    pub(crate) settings: Option<Box<[u8]>>,
+}
+
+impl EbmlElement<MkvSchema> for ContentCompressionElement {
+    const TYPE: MkvElement = MkvElement::ContentCompression;
+
+    fn read<R: ReadEbml>(it: &mut MkvEbmlIterator<R>, hdr: &MkvEbmlElementHeader) -> Result<Self> {
+        let mut algo = None;
+        let mut settings = None;
+
+        while let Some(child) = it.next_header()? {
+            match child.element_type() {
+                MkvElement::ContentCompAlgo => {
+                    // Mandatory element. Schema-defined default is 0 (zlib).
+                    algo = it.read_u64()?;
+                }
+                MkvElement::ContentCompSettings => {
+                    // Non-mandatory element.
+                    settings = Some(it.read_binary()?);
+                }
+                other => {
+                    // Unexpected child element.
+                    log::debug!("ignored {:?} child {:?}", hdr.element_type(), other);
+                }
+            }
+        }
+
+        Ok(Self { algo: algo.unwrap_or(0), settings })
     }
 }
 

@@ -161,6 +161,7 @@ pub(crate) fn extract_frames(
     match lacing {
         Lacing::None => {
             let data = reader.read_boxed_slice_exact(block.len() - reader.pos() as usize)?;
+            let data = track.content_decoders.decode_frame(data);
             let dur = FrameDurationIter::new(block_duration, track, 1).next();
             frames.push_back(Frame { track_num, pts, data, dur });
         }
@@ -187,6 +188,7 @@ pub(crate) fn extract_frames(
 
             for frame_size in sizes {
                 let data = reader.read_boxed_slice_exact(frame_size as usize)?;
+                let data = track.content_decoders.decode_frame(data);
                 let dur = dur_it.next();
 
                 frames.push_back(Frame { track_num, pts, data, dur });
@@ -201,6 +203,7 @@ pub(crate) fn extract_frames(
             // Size of last frame is not provided so we read to the end of the block.
             let size = block.len() - reader.pos() as usize;
             let data = reader.read_boxed_slice_exact(size)?;
+            let data = track.content_decoders.decode_frame(data);
             frames.push_back(Frame { track_num, pts, data, dur: dur_it.next() });
         }
         Lacing::FixedSize => {
@@ -215,6 +218,7 @@ pub(crate) fn extract_frames(
             let frame_size = total_size / num_frames;
             for _ in 0..num_frames {
                 let data = reader.read_boxed_slice_exact(frame_size)?;
+                let data = track.content_decoders.decode_frame(data);
                 let dur = dur_it.next();
 
                 frames.push_back(Frame { track_num, pts, data, dur });

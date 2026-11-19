@@ -15,6 +15,7 @@
 #![allow(clippy::manual_range_contains)]
 
 mod codecs;
+mod content_encoding;
 mod demuxer;
 mod ebml;
 mod lacing;
